@@ -3,7 +3,7 @@ use addr::email::Host;
 use addr::parse_email_address;
 use clap::Parser;
 use colored::Colorize;
-use dashmap::DashMap;
+use dashmap::{DashMap, Entry};
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::ops::AddAssign;
@@ -123,18 +123,14 @@ fn worker_function(
                 continue;
             };
 
-            // let dmarc_cache = match MX_CACHE.entry(Arc::from(name.as_str())) {
-            //     Entry::Occupied(e) => e.into_ref(),
-            //     Entry::Vacant(e) => e.insert(DmarcPolicy::scan(name.as_str()).await),
-            // }
-            // .value()
-            // .clone();
+            let dmarc_cache = match MX_CACHE.entry(Arc::from(name.as_str())) {
+                Entry::Occupied(e) => e.into_ref(),
+                Entry::Vacant(e) => e.insert(DmarcPolicy::scan(name.as_str()).await),
+            }
+            .value()
+            .clone();
 
-            if writer_tx
-                .send((index, DmarcPolicy::scan(name.as_str()).await, email))
-                .await
-                .is_err()
-            {
+            if writer_tx.send((index, dmarc_cache, email)).await.is_err() {
                 eprintln!("Failed to send data to writer");
                 drop(writer_tx);
                 break;
@@ -201,7 +197,7 @@ async fn send_seqcst(
     loop {
         pool.retain(|x| !x.is_closed());
 
-        if let Some(tx) = pool.pop_back() {
+        if let Some(tx) = pool.pop_front() {
             match tx.send_timeout(data, Duration::from_millis(25)).await {
                 Ok(_) => {
                     pool.push_back(tx);
