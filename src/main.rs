@@ -11,7 +11,9 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use strum::Display;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{
+    stdout, AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter, Lines,
+};
 use tokio::sync::mpsc;
 use tokio::task::{id, JoinSet};
 use tokio::{fs, io, spawn};
@@ -91,22 +93,8 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("Workers initialized");
 
-    println!(
-        "Reading and dispatching each line [FILE]: {}",
-        args.input.display()
-    );
-    let mut reader = open_r(args.input).await.map(BufReader::new)?.lines();
-    let mut index = 0;
-    while let Some(line) = reader.next_line().await? {
-        index.add_assign(1);
-        match send_seqcst(pools, (index, line.trim().to_lowercase().into())).await {
-            Ok(pool) => pools = pool,
-            Err(_) => {
-                eprintln!("No available threads to process the line");
-                break;
-            }
-        }
-    }
+    let reader = open_r(args.input).await.map(BufReader::new)?.lines();
+    start_dispatch(pools, reader).await;
 
     println!("Waiting background tasks to finish");
 
@@ -117,6 +105,48 @@ async fn main() -> anyhow::Result<()> {
     writer_handle.await??;
 
     Ok(())
+}
+
+pub async fn count_lines(lines: &mut Lines<BufReader<fs::File>>) -> io::Result<usize> {
+    let mut i = 0;
+    while lines.next_line().await?.is_some() {
+        i += 1;
+    }
+
+    lines.get_mut().rewind().await.map(|_| i)
+}
+
+pub async fn start_dispatch(mut pools: Pool, mut lines: Lines<BufReader<fs::File>>) {
+    let mut stdout = stdout();
+
+    let total_lines = count_lines(&mut lines).await.unwrap();
+    let mut index = 0;
+
+    while let Some(line) = lines.next_line().await.unwrap() {
+        index.add_assign(1);
+
+        match send_seqcst(pools, (index, line.trim().to_lowercase().into())).await {
+            Ok(pool) => pools = pool,
+            Err(_) => {
+                eprintln!("No available threads to process the line");
+                break;
+            }
+        }
+
+        let pct = (index as f64) * 100.0 / (total_lines as f64);
+        let pct_str = if pct < 25.0 {
+            format!("{pct:.2}%").red()
+        } else if pct < 50.0 {
+            format!("{pct:.2}%").yellow()
+        } else if pct < 75.0 {
+            format!("{pct:.2}%").blue()
+        } else {
+            format!("{pct:.2}%").green()
+        };
+        _ = stdout.write_all(format!("{pct_str}\r").as_bytes()).await;
+    }
+
+    stdout.flush().await.unwrap()
 }
 
 async fn open_r(path: impl AsRef<Path>) -> io::Result<fs::File> {
