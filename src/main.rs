@@ -44,7 +44,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    println!(
+        "{} v{}",
+        "Dmarc Scanner".green(),
+        env!("CARGO_PKG_VERSION").green()
+    );
     _ = &*MX_CACHE; // Initialize the cache
+
+    println!("{}", "Initializing...".green());
 
     let mut args = Args::parse();
     if args.buffer == 0 {
@@ -61,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    println!("Setting up buffered writer");
     let none_buffer = open_w(args.directory.join("none.txt")).await?;
     let bad_buffer = open_w(args.directory.join("bad.txt")).await?;
     let notfound_buffer = open_w(args.directory.join("notfound.txt")).await?;
@@ -72,7 +80,9 @@ async fn main() -> anyhow::Result<()> {
         BufWriter::new(none_buffer),
         BufWriter::new(notfound_buffer),
     ));
+    println!("Writer initialized");
 
+    println!("Setting up worker threads");
     let (worker_handles, pools) = (0..args.thread)
         .map(|_| {
             let (tx, rx) = mpsc::channel::<(usize, Arc<str>)>(1);
@@ -81,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             (handle, tx)
         })
         .collect::<(Vec<_>, VecDeque<_>)>();
+    println!("Workers initialized");
 
     reader_handle(args.input, pools).await?;
 
@@ -144,6 +155,7 @@ fn worker_function(
 }
 
 async fn reader_handle(input: impl AsRef<Path>, mut pools: Pool) -> io::Result<()> {
+    println!("Reading file: {}", input.as_ref().display());
     let mut reader = open_r(input).await.map(BufReader::new)?.lines();
     let mut index = 0;
 
