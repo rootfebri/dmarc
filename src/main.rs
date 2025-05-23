@@ -99,7 +99,6 @@ async fn main() -> anyhow::Result<()> {
     let mut index = 0;
     while let Some(line) = reader.next_line().await? {
         index.add_assign(1);
-        println!("Processing line {index}: {line}");
         match send_seqcst(pools, (index, line.trim().to_lowercase().into())).await {
             Ok(pool) => pools = pool,
             Err(_) => {
@@ -203,7 +202,6 @@ async fn send_seqcst(
     mut data: (usize, Arc<str>),
 ) -> Result<Pool, (usize, Arc<str>)> {
     let time = Duration::from_millis(1);
-    let queue = data.0;
 
     while !pool.is_empty() {
         pool.retain(|x| !x.is_closed());
@@ -213,10 +211,7 @@ async fn send_seqcst(
         pool.push_back(tx);
 
         match status {
-            Ok(_) => {
-                println!("Entry #{queue} sent to worker");
-                return Ok(pool);
-            }
+            Ok(_) => return Ok(pool),
             Err(timeout) => data = timeout.into_inner(),
         }
     }
