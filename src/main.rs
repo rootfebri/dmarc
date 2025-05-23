@@ -24,7 +24,7 @@ use trust_dns_resolver::proto::rr::RecordType;
 use trust_dns_resolver::TokioAsyncResolver;
 use whirlwind::ShardMap;
 
-type Pool = VecDeque<mpsc::Sender<(usize, Arc<str>)>>;
+type Pool = VecDeque<mpsc::Sender<Arc<str>>>;
 
 static MX_CACHE: LazyLock<ShardMap<Arc<str>, DmarcPolicy>> = LazyLock::new(ShardMap::new);
 
@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     let bad_buffer = open_w(args.directory.join("bad.txt")).await?;
     let notfound_buffer = open_w(args.directory.join("notfound.txt")).await?;
 
-    let (writer_tx, writer_rx) = mpsc::channel::<(usize, DmarcPolicy, Arc<str>)>(args.buffer);
+    let (writer_tx, writer_rx) = mpsc::channel::<(DmarcPolicy, Arc<str>)>(args.buffer);
     let writer_handle = spawn(writer_handle(
         writer_rx,
         BufWriter::new(bad_buffer),
@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let (mut worker_handles, mut pools) = (JoinSet::new(), VecDeque::new());
     println!("Setting up worker threads");
     for _ in 0..args.thread {
-        let (tx, rx) = mpsc::channel::<(usize, Arc<str>)>(1);
+        let (tx, rx) = mpsc::channel::<Arc<str>>(1);
         pools.push_back(tx);
         worker_handles.spawn(worker_function(rx, writer_tx.clone()));
     }
@@ -125,7 +125,7 @@ pub async fn start_dispatch(mut pools: Pool, mut lines: Lines<BufReader<fs::File
     while let Some(line) = lines.next_line().await.unwrap() {
         index.add_assign(1);
 
-        match send_seqcst(pools, (index, line.trim().to_lowercase().into())).await {
+        match send_seqcst(pools, line.trim().to_lowercase().into()).await {
             Ok(pool) => pools = pool,
             Err(_) => {
                 eprintln!("No available threads to process the line");
@@ -162,10 +162,10 @@ async fn open_w(path: impl AsRef<Path>) -> io::Result<fs::File> {
 }
 
 async fn worker_function(
-    mut worker_rx: mpsc::Receiver<(usize, Arc<str>)>,
-    writer_tx: mpsc::Sender<(usize, DmarcPolicy, Arc<str>)>,
+    mut worker_rx: mpsc::Receiver<Arc<str>>,
+    writer_tx: mpsc::Sender<(DmarcPolicy, Arc<str>)>,
 ) -> anyhow::Result<()> {
-    while let Some((index, email)) = worker_rx.recv().await {
+    while let Some(email) = worker_rx.recv().await {
         let address = match parse_email_address(email.as_ref()) {
             Ok(addr) => addr,
             Err(err) => {
@@ -187,7 +187,7 @@ async fn worker_function(
             dmarc
         };
 
-        if writer_tx.send((index, dmarc_cache, email)).await.is_err() {
+        if writer_tx.send((dmarc_cache, email)).await.is_err() {
             eprintln!("Failed to send data to writer");
             drop(writer_tx);
             break;
@@ -199,14 +199,12 @@ async fn worker_function(
 }
 
 async fn writer_handle(
-    mut writer_rx: mpsc::Receiver<(usize, DmarcPolicy, Arc<str>)>,
+    mut writer_rx: mpsc::Receiver<(DmarcPolicy, Arc<str>)>,
     mut bad_buffer: BufWriter<fs::File>,
     mut none_buffer: BufWriter<fs::File>,
     mut notfound_buffer: BufWriter<fs::File>,
 ) -> io::Result<()> {
-    while let Some((idx, dmarc, data)) = writer_rx.recv().await {
-        println!("[{idx}] {data} ->  {dmarc:?}");
-
+    while let Some((dmarc, data)) = writer_rx.recv().await {
         match dmarc {
             Reject | Quarantine => {
                 bad_buffer.write_all(data.as_bytes()).await?;
@@ -227,10 +225,7 @@ async fn writer_handle(
     Ok(())
 }
 
-async fn send_seqcst(
-    mut pool: Pool,
-    mut data: (usize, Arc<str>),
-) -> Result<Pool, (usize, Arc<str>)> {
+async fn send_seqcst(mut pool: Pool, mut data: Arc<str>) -> Result<Pool, Arc<str>> {
     let time = Duration::from_millis(1);
 
     while !pool.is_empty() {
