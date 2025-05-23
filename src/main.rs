@@ -201,16 +201,13 @@ async fn writer_handle(
     Ok(())
 }
 
-async fn lookup<N: AsRef<str>>(name: N, rtype: RecordType) -> Result<Lookup, ResolveError> {
-    let rt = TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default());
-    rt.lookup(name.as_ref(), rtype).await
-}
-
 async fn send_seqcst(
     mut pool: Pool,
     mut data: (usize, Arc<str>),
 ) -> Result<Pool, (usize, Arc<str>)> {
     let time = Duration::from_millis(1);
+    let queue = data.0;
+
     while !pool.is_empty() {
         pool.retain(|x| !x.is_closed());
         let Some(tx) = pool.pop_front() else { continue };
@@ -219,15 +216,20 @@ async fn send_seqcst(
         pool.push_back(tx);
 
         match status {
-            Ok(_) => return Ok(pool),
-            Err(timeout) => {
-                data = timeout.into_inner();
-                continue;
+            Ok(_) => {
+                println!("Entry #{queue} sent to worker");
+                return Ok(pool);
             }
+            Err(timeout) => data = timeout.into_inner(),
         }
     }
 
     Err(data)
+}
+
+async fn lookup<N: AsRef<str>>(name: N, rtype: RecordType) -> Result<Lookup, ResolveError> {
+    let rt = TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default());
+    rt.lookup(name.as_ref(), rtype).await
 }
 
 #[derive(Display, Clone, PartialEq, Eq, Hash)]
