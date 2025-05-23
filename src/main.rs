@@ -161,6 +161,7 @@ async fn reader_handle(input: impl AsRef<Path>, mut pools: Pool) -> io::Result<(
 
     while let Some(line) = reader.next_line().await? {
         index.add_assign(1);
+        println!("Processing line {index}: {line}");
         match send_seqcst(pools, (index, line.into())).await {
             Ok(pool) => pools = pool,
             Err(_) => return Err(io::Error::other("No available threads to process the line")),
