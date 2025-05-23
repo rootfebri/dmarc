@@ -14,8 +14,8 @@ use std::time::Duration;
 use strum::Display;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
-use tokio::task::{id, JoinHandle};
-use tokio::{fs, io};
+use tokio::task::id;
+use tokio::{fs, io, spawn};
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use trust_dns_resolver::error::ResolveError;
 use trust_dns_resolver::lookup::Lookup;
@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let notfound_buffer = open_w(args.directory.join("notfound.txt")).await?;
 
     let (writer_tx, writer_rx) = mpsc::channel::<(usize, DmarcPolicy, Arc<str>)>(args.buffer);
-    let writer_handle = tokio::spawn(writer_handle(
+    let writer_handle = spawn(writer_handle(
         writer_rx,
         BufWriter::new(bad_buffer),
         BufWriter::new(none_buffer),
@@ -82,18 +82,31 @@ async fn main() -> anyhow::Result<()> {
     ));
     println!("Writer initialized");
 
+    let (mut worker_handles, mut pools) = (vec![], VecDeque::new());
     println!("Setting up worker threads");
-    let (worker_handles, pools) = (0..args.thread)
-        .map(|_| {
-            let (tx, rx) = mpsc::channel::<(usize, Arc<str>)>(1);
-
-            let handle: JoinHandle<anyhow::Result<()>> = worker_function(rx, writer_tx.clone());
-            (handle, tx)
-        })
-        .collect::<(Vec<_>, VecDeque<_>)>();
+    for _ in 0..args.thread {
+        let (tx, rx) = mpsc::channel::<(usize, Arc<str>)>(1);
+        pools.push_back(tx);
+        worker_handles.push(spawn(worker_function(rx, writer_tx.clone())));
+    }
     println!("Workers initialized");
 
-    reader_handle(args.input, pools).await?;
+    println!("Reading file: {}", args.input.display());
+    let mut reader = open_r(args.input).await.map(BufReader::new)?.lines();
+    let mut index = 0;
+    while let Some(line) = reader.next_line().await? {
+        index.add_assign(1);
+        println!("Processing line {index}: {line}");
+        match send_seqcst(pools, (index, line.trim().to_lowercase().into())).await {
+            Ok(pool) => pools = pool,
+            Err(_) => {
+                eprintln!("No available threads to process the line");
+                break;
+            }
+        }
+    }
+
+    println!("Finished reading file");
 
     for worker_handle in worker_handles {
         worker_handle.await??;
@@ -116,59 +129,38 @@ async fn open_w(path: impl AsRef<Path>) -> io::Result<fs::File> {
         .await
 }
 
-fn worker_function(
+async fn worker_function(
     mut worker_rx: mpsc::Receiver<(usize, Arc<str>)>,
     writer_tx: mpsc::Sender<(usize, DmarcPolicy, Arc<str>)>,
-) -> JoinHandle<anyhow::Result<()>> {
-    let function = async move {
-        while let Some((index, email)) = worker_rx.recv().await {
-            let address = match parse_email_address(email.as_ref()) {
-                Ok(addr) => addr,
-                Err(err) => {
-                    eprintln!("{email}: {err}");
-                    continue;
-                }
-            };
-
-            let Host::Domain(name) = address.host() else {
+) -> anyhow::Result<()> {
+    while let Some((index, email)) = worker_rx.recv().await {
+        let address = match parse_email_address(email.as_ref()) {
+            Ok(addr) => addr,
+            Err(err) => {
+                eprintln!("{email}: {err}");
                 continue;
-            };
-
-            let dmarc_cache = match MX_CACHE.entry(Arc::from(name.as_str())) {
-                Entry::Occupied(e) => e.into_ref(),
-                Entry::Vacant(e) => e.insert(DmarcPolicy::scan(name.as_str()).await),
             }
-            .value()
-            .clone();
+        };
 
-            if writer_tx.send((index, dmarc_cache, email)).await.is_err() {
-                eprintln!("Failed to send data to writer");
-                drop(writer_tx);
-                break;
-            }
+        let Host::Domain(name) = address.host() else {
+            continue;
+        };
+
+        let dmarc_cache = match MX_CACHE.entry(Arc::from(name.as_str())) {
+            Entry::Occupied(e) => e.into_ref(),
+            Entry::Vacant(e) => e.insert(DmarcPolicy::scan(name.as_str()).await),
         }
+        .value()
+        .clone();
 
-        println!("Worker #{:?} finished processing", id());
-        Ok(())
-    };
-    tokio::spawn(function)
-}
-
-async fn reader_handle(input: impl AsRef<Path>, mut pools: Pool) -> io::Result<()> {
-    println!("Reading file: {}", input.as_ref().display());
-    let mut reader = open_r(input).await.map(BufReader::new)?.lines();
-    let mut index = 0;
-
-    while let Some(line) = reader.next_line().await? {
-        index.add_assign(1);
-        println!("Processing line {index}: {line}");
-        match send_seqcst(pools, (index, line.into())).await {
-            Ok(pool) => pools = pool,
-            Err(_) => return Err(io::Error::other("No available threads to process the line")),
+        if writer_tx.send((index, dmarc_cache, email)).await.is_err() {
+            eprintln!("Failed to send data to writer");
+            drop(writer_tx);
+            break;
         }
     }
 
-    println!("Finished reading file");
+    println!("Worker #{:?} finished processing", id());
     Ok(())
 }
 
