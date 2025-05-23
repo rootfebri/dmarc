@@ -14,7 +14,7 @@ use std::time::Duration;
 use strum::Display;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{id, JoinHandle};
 use tokio::{fs, io};
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use trust_dns_resolver::error::ResolveError;
@@ -137,6 +137,7 @@ fn worker_function(
             }
         }
 
+        println!("Worker #{:?} finished processing", id());
         Ok(())
     };
     tokio::spawn(function)
@@ -154,6 +155,7 @@ async fn reader_handle(input: impl AsRef<Path>, mut pools: Pool) -> io::Result<(
         }
     }
 
+    println!("Finished reading file");
     Ok(())
 }
 
@@ -182,6 +184,7 @@ async fn writer_handle(
         }
     }
 
+    println!("All data processed");
     Ok(())
 }
 
