@@ -211,22 +211,22 @@ async fn send_seqcst(
     mut data: (usize, Arc<str>),
 ) -> Result<Pool, (usize, Arc<str>)> {
     loop {
-        pool.retain(|x| !x.is_closed());
-
-        if let Some(tx) = pool.pop_front() {
-            match tx.send_timeout(data, Duration::from_millis(25)).await {
-                Ok(_) => {
-                    pool.push_back(tx);
-                    break Ok(pool);
-                }
-                Err(timeout) => {
-                    data = timeout.into_inner();
-                    continue;
-                }
-            }
+        if pool.is_empty() {
+            break Err(data);
         }
 
-        break Err(data);
+        pool.retain(|x| !x.is_closed());
+        let Some(tx) = pool.pop_front() else { continue };
+        let status = tx.send_timeout(data, Duration::from_millis(5)).await;
+        pool.push_back(tx);
+
+        match status {
+            Ok(_) => return Ok(pool),
+            Err(timeout) => {
+                data = timeout.into_inner();
+                continue;
+            }
+        }
     }
 }
 
