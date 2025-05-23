@@ -3,7 +3,6 @@ use addr::email::Host;
 use addr::parse_email_address;
 use clap::Parser;
 use colored::Colorize;
-use dashmap::{DashMap, Entry};
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::ops::AddAssign;
@@ -14,17 +13,18 @@ use std::time::Duration;
 use strum::Display;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
-use tokio::task::id;
+use tokio::task::{id, JoinSet};
 use tokio::{fs, io, spawn};
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use trust_dns_resolver::error::ResolveError;
 use trust_dns_resolver::lookup::Lookup;
 use trust_dns_resolver::proto::rr::RecordType;
 use trust_dns_resolver::TokioAsyncResolver;
+use whirlwind::ShardMap;
 
 type Pool = VecDeque<mpsc::Sender<(usize, Arc<str>)>>;
 
-static MX_CACHE: LazyLock<DashMap<Arc<str>, DmarcPolicy>> = LazyLock::new(Default::default);
+static MX_CACHE: LazyLock<ShardMap<Arc<str>, DmarcPolicy>> = LazyLock::new(ShardMap::new);
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -82,16 +82,19 @@ async fn main() -> anyhow::Result<()> {
     ));
     println!("Writer initialized");
 
-    let (mut worker_handles, mut pools) = (vec![], VecDeque::new());
+    let (mut worker_handles, mut pools) = (JoinSet::new(), VecDeque::new());
     println!("Setting up worker threads");
     for _ in 0..args.thread {
         let (tx, rx) = mpsc::channel::<(usize, Arc<str>)>(1);
         pools.push_back(tx);
-        worker_handles.push(spawn(worker_function(rx, writer_tx.clone())));
+        worker_handles.spawn(worker_function(rx, writer_tx.clone()));
     }
     println!("Workers initialized");
 
-    println!("Reading file: {}", args.input.display());
+    println!(
+        "Reading and dispatching each line [FILE]: {}",
+        args.input.display()
+    );
     let mut reader = open_r(args.input).await.map(BufReader::new)?.lines();
     let mut index = 0;
     while let Some(line) = reader.next_line().await? {
@@ -106,10 +109,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("Finished reading file");
+    println!("Waiting background tasks to finish");
 
-    for worker_handle in worker_handles {
-        worker_handle.await??;
+    for h in worker_handles.join_all().await {
+        h?;
     }
 
     writer_handle.await??;
@@ -146,12 +149,14 @@ async fn worker_function(
             continue;
         };
 
-        let dmarc_cache = match MX_CACHE.entry(Arc::from(name.as_str())) {
-            Entry::Occupied(e) => e.into_ref(),
-            Entry::Vacant(e) => e.insert(DmarcPolicy::scan(name.as_str()).await),
-        }
-        .value()
-        .clone();
+        let domain: Arc<str> = Arc::from(name.as_str());
+        let dmarc_cache = if let Some(cache) = MX_CACHE.get(&domain).await {
+            cache.clone()
+        } else {
+            let dmarc = DmarcPolicy::scan(&domain).await;
+            MX_CACHE.insert(domain, dmarc.clone()).await;
+            dmarc
+        };
 
         if writer_tx.send((index, dmarc_cache, email)).await.is_err() {
             eprintln!("Failed to send data to writer");
