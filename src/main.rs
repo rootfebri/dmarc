@@ -3,7 +3,7 @@ use addr::email::Host;
 use addr::parse_email_address;
 use clap::Parser;
 use colored::Colorize;
-use dashmap::{DashMap, Entry};
+use dashmap::DashMap;
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::ops::AddAssign;
@@ -77,8 +77,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|_| {
             let (tx, rx) = mpsc::channel::<(usize, Arc<str>)>(1);
 
-            let handle: JoinHandle<anyhow::Result<()>> =
-                tokio::spawn(worker_function(rx, writer_tx.clone()));
+            let handle: JoinHandle<anyhow::Result<()>> = worker_function(rx, writer_tx.clone());
             (handle, tx)
         })
         .collect::<(Vec<_>, VecDeque<_>)>();
@@ -106,38 +105,45 @@ async fn open_w(path: impl AsRef<Path>) -> io::Result<fs::File> {
         .await
 }
 
-async fn worker_function(
+fn worker_function(
     mut worker_rx: mpsc::Receiver<(usize, Arc<str>)>,
     writer_tx: mpsc::Sender<(usize, DmarcPolicy, Arc<str>)>,
-) -> anyhow::Result<()> {
-    while let Some((index, email)) = worker_rx.recv().await {
-        let address = match parse_email_address(email.as_ref()) {
-            Ok(addr) => addr,
-            Err(err) => {
-                eprintln!("{email}: {err}");
+) -> JoinHandle<anyhow::Result<()>> {
+    let function = async move {
+        while let Some((index, email)) = worker_rx.recv().await {
+            let address = match parse_email_address(email.as_ref()) {
+                Ok(addr) => addr,
+                Err(err) => {
+                    eprintln!("{email}: {err}");
+                    continue;
+                }
+            };
+
+            let Host::Domain(name) = address.host() else {
                 continue;
+            };
+
+            // let dmarc_cache = match MX_CACHE.entry(Arc::from(name.as_str())) {
+            //     Entry::Occupied(e) => e.into_ref(),
+            //     Entry::Vacant(e) => e.insert(DmarcPolicy::scan(name.as_str()).await),
+            // }
+            // .value()
+            // .clone();
+
+            if writer_tx
+                .send((index, DmarcPolicy::scan(name.as_str()).await, email))
+                .await
+                .is_err()
+            {
+                eprintln!("Failed to send data to writer");
+                drop(writer_tx);
+                break;
             }
-        };
-
-        let Host::Domain(name) = address.host() else {
-            continue;
-        };
-
-        let dmarc_cache = match MX_CACHE.entry(Arc::from(name.as_str())) {
-            Entry::Occupied(e) => e.into_ref(),
-            Entry::Vacant(e) => e.insert(DmarcPolicy::scan(name.as_str()).await),
         }
-        .value()
-        .clone();
 
-        if writer_tx.send((index, dmarc_cache, email)).await.is_err() {
-            eprintln!("Failed to send data to writer");
-            drop(writer_tx);
-            break;
-        }
-    }
-
-    Ok(())
+        Ok(())
+    };
+    tokio::spawn(function)
 }
 
 async fn reader_handle(input: impl AsRef<Path>, mut pools: Pool) -> io::Result<()> {
