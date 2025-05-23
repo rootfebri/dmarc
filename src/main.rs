@@ -210,14 +210,12 @@ async fn send_seqcst(
     mut pool: Pool,
     mut data: (usize, Arc<str>),
 ) -> Result<Pool, (usize, Arc<str>)> {
-    loop {
-        if pool.is_empty() {
-            break Err(data);
-        }
-
+    let time = Duration::from_millis(1);
+    while !pool.is_empty() {
         pool.retain(|x| !x.is_closed());
         let Some(tx) = pool.pop_front() else { continue };
-        let status = tx.send_timeout(data, Duration::from_millis(5)).await;
+
+        let status = tx.send_timeout(data, time).await;
         pool.push_back(tx);
 
         match status {
@@ -228,6 +226,8 @@ async fn send_seqcst(
             }
         }
     }
+
+    Err(data)
 }
 
 #[derive(Display, Clone, PartialEq, Eq, Hash)]
