@@ -132,6 +132,7 @@ async fn worker_function(
 
         if writer_tx.send((index, dmarc_cache, email)).await.is_err() {
             eprintln!("Failed to send data to writer");
+            drop(writer_tx);
             break;
         }
     }
