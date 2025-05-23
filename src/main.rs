@@ -123,11 +123,12 @@ async fn worker_function(
             continue;
         };
 
-        let dmarc_cache = *match MX_CACHE.entry(Arc::from(name.as_str())) {
+        let dmarc_cache = match MX_CACHE.entry(Arc::from(name.as_str())) {
             Entry::Occupied(e) => e.into_ref(),
             Entry::Vacant(e) => e.insert(DmarcPolicy::scan(name.as_str()).await),
         }
-        .value();
+        .value()
+        .clone();
 
         if writer_tx.send((index, dmarc_cache, email)).await.is_err() {
             eprintln!("Failed to send data to writer");
@@ -160,7 +161,7 @@ async fn writer_handle(
     mut notfound_buffer: BufWriter<fs::File>,
 ) -> io::Result<()> {
     while let Some((idx, dmarc, data)) = writer_rx.recv().await {
-        println!("[{idx}] {data} ->  {dmarc:?}\n");
+        println!("[{idx}] {data} ->  {dmarc:?}");
 
         match dmarc {
             Reject | Quarantine => {
@@ -210,7 +211,7 @@ async fn send_seqcst(
     }
 }
 
-#[derive(Display, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Display, Clone, PartialEq, Eq, Hash)]
 enum DmarcPolicy {
     #[strum(to_string = "Reject")]
     Reject,
@@ -263,7 +264,7 @@ impl Debug for DmarcPolicy {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use DmarcPolicy::*;
         match *self {
-            variants @ (Reject | Quarantine) => {
+            ref variants @ (Reject | Quarantine) => {
                 f.write_str(&variants.to_string().red().to_string())
             }
             None => f.write_str(&"None".green().to_string()),
